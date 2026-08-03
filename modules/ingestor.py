@@ -1,22 +1,29 @@
 import json
 import os
 import sqlite3
+from datetime import datetime
+
+from modules.data_loader import load_rule_catalog
 
 EVE_LOG_PATH = "/var/log/suricata/eve.json"
 DB_PATH = "alerts.db"
-MAX_TRAFFIC_ROWS = 5000  # traffic is high-volume - cap so the DB file doesn't grow forever now that it's persisted
+
+MAX_TRAFFIC_ROWS = 5000
+MAX_ALERT_ROWS_BEFORE_ROTATE = 25000
 
 
-def _connect():
-    conn = sqlite3.connect(DB_PATH)
-    # WAL mode lets the dashboard READ from the db while ingestion WRITES to it,
-    # without one blocking the other - reduces stutter/locking pauses.
+def _connect(db_path=DB_PATH):
+    conn = sqlite3.connect(db_path)
     conn.execute("PRAGMA journal_mode=WAL")
     return conn
 
 
-def init_db():
-    conn = _connect()
+def init_db(conn=None):
+    close_at_end = False
+    if conn is None:
+        conn = _connect()
+        close_at_end = True
+
     cursor = conn.cursor()
 
     cursor.execute("""
@@ -42,9 +49,19 @@ def init_db():
             confidence TEXT,
             attack_target TEXT,
             raw_json TEXT,
+            enrichment_json TEXT,
             status TEXT DEFAULT 'new'
         )
     """)
+
+    # Migration guard: if alerts.db already existed from before this column
+    # was added, ALTER TABLE adds it. If the column is already there (brand
+    # new DB created via the CREATE TABLE above), this just fails silently -
+    # that's expected and fine, not an error worth surfacing.
+    try:
+        cursor.execute("ALTER TABLE alerts ADD COLUMN enrichment_json TEXT")
+    except sqlite3.OperationalError:
+        pass
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS traffic (
@@ -72,7 +89,9 @@ def init_db():
 
     cursor.execute("CREATE TABLE IF NOT EXISTS state (key TEXT PRIMARY KEY, value TEXT)")
     conn.commit()
-    conn.close()
+
+    if close_at_end:
+        conn.close()
 
 
 def _safe_get(d, *keys, default=None):
@@ -93,11 +112,63 @@ def get_last_position(conn):
 
 
 def save_position(conn, offset):
-    conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('file_offset', ?)", (str(offset),))
+    conn.execute(
+        "INSERT OR REPLACE INTO state (key, value) VALUES ('file_offset', ?)",
+        (str(offset),),
+    )
     conn.commit()
 
 
-def _insert_alert(cursor, data):
+def check_and_rotate_db():
+    if not os.path.exists(DB_PATH):
+        return
+
+    conn = _connect()
+    cursor = conn.cursor()
+
+    try:
+        cursor.execute("SELECT COUNT(*) FROM alerts")
+        alert_count = cursor.fetchone()[0]
+        offset = get_last_position(conn)
+    except sqlite3.OperationalError:
+        conn.close()
+        return
+
+    if alert_count >= MAX_ALERT_ROWS_BEFORE_ROTATE:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.close()
+
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        archive_name = f"alerts_archive_{timestamp_str}.db"
+        os.rename(DB_PATH, archive_name)
+
+        for ext in ["-wal", "-shm"]:
+            if os.path.exists(DB_PATH + ext):
+                try:
+                    os.remove(DB_PATH + ext)
+                except OSError:
+                    pass
+
+        new_conn = _connect()
+        init_db(new_conn)
+        save_position(new_conn, offset)
+        new_conn.close()
+
+        print(f"[+] Rotated active database ({alert_count} alerts) to '{archive_name}'.")
+    else:
+        conn.close()
+
+
+def _find_enrichment(rule_catalog, signature_id):
+    """Looks up the matching rule-catalog entry for a signature_id. Catalog
+    keys are strings (see data_loader.py), so we normalize before lookup."""
+    if signature_id is None:
+        return None
+    key = str(signature_id)
+    return rule_catalog.get(key)
+
+
+def _insert_alert(cursor, data, rule_catalog):
     alert = data.get("alert", {}) or {}
     metadata = alert.get("metadata", {}) or {}
 
@@ -110,55 +181,73 @@ def _insert_alert(cursor, data):
     ts = data.get("timestamp")
     dedup_key = f"{flow_id}_{sig_id}_{ts}"
 
-    cursor.execute("""
+    # Snapshot whatever rule-catalog data matches this SID at the moment the
+    # alert is ingested, and store it alongside the alert itself. This means
+    # each alert keeps its own enrichment even if the catalog files change
+    # later, and the dashboard can read it directly without a live lookup.
+    enrichment = _find_enrichment(rule_catalog, sig_id)
+    enrichment_json = json.dumps(enrichment) if enrichment else None
+
+    cursor.execute(
+        """
         INSERT OR IGNORE INTO alerts
         (dedup_key, timestamp, src_ip, src_port, dest_ip, dest_port, proto,
          in_iface, flow_id, direction, bytes_toserver, bytes_toclient,
          signature, signature_id, category, severity, signature_severity,
-         confidence, attack_target, raw_json, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
-    """, (
-        dedup_key, ts, data.get("src_ip"), data.get("src_port"),
-        data.get("dest_ip"), data.get("dest_port"), data.get("proto"),
-        data.get("in_iface"), flow_id, data.get("direction"),
-        _safe_get(data, "flow", "bytes_toserver"),
-        _safe_get(data, "flow", "bytes_toclient"),
-        alert.get("signature"), sig_id, alert.get("category"), alert.get("severity"),
-        _first("signature_severity"), _first("confidence"), _first("attack_target"),
-        json.dumps(data),
-    ))
+         confidence, attack_target, raw_json, enrichment_json, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')
+    """,
+        (
+            dedup_key, ts, data.get("src_ip"), data.get("src_port"),
+            data.get("dest_ip"), data.get("dest_port"), data.get("proto"),
+            data.get("in_iface"), flow_id, data.get("direction"),
+            _safe_get(data, "flow", "bytes_toserver"),
+            _safe_get(data, "flow", "bytes_toclient"),
+            alert.get("signature"), sig_id, alert.get("category"), alert.get("severity"),
+            _first("signature_severity"), _first("confidence"), _first("attack_target"),
+            json.dumps(data), enrichment_json,
+        ),
+    )
 
 
 def _insert_traffic(cursor, data, event_type):
     stats = data.get("stats", {}) or {}
-    cursor.execute("""
+    cursor.execute(
+        """
         INSERT INTO traffic
         (timestamp, event_type, src_ip, src_port, dest_ip, dest_port, proto,
          app_proto, in_iface, flow_id, direction, bytes_toserver, bytes_toclient,
          uptime_sec, packets_captured, packets_dropped, decoder_pkts, decoder_bytes)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data.get("timestamp"), event_type, data.get("src_ip"), data.get("src_port"),
-        data.get("dest_ip"), data.get("dest_port"), data.get("proto"), data.get("app_proto"),
-        data.get("in_iface"), data.get("flow_id"), data.get("direction"),
-        _safe_get(data, "flow", "bytes_toserver"), _safe_get(data, "flow", "bytes_toclient"),
-        stats.get("uptime"), _safe_get(stats, "capture", "kernel_packets"),
-        _safe_get(stats, "capture", "kernel_drops"), _safe_get(stats, "decoder", "pkts"),
-        _safe_get(stats, "decoder", "bytes"),
-    ))
+    """,
+        (
+            data.get("timestamp"), event_type, data.get("src_ip"), data.get("src_port"),
+            data.get("dest_ip"), data.get("dest_port"), data.get("proto"), data.get("app_proto"),
+            data.get("in_iface"), data.get("flow_id"), data.get("direction"),
+            _safe_get(data, "flow", "bytes_toserver"), _safe_get(data, "flow", "bytes_toclient"),
+            stats.get("uptime"), _safe_get(stats, "capture", "kernel_packets"),
+            _safe_get(stats, "capture", "kernel_drops"), _safe_get(stats, "decoder", "pkts"),
+            _safe_get(stats, "decoder", "bytes"),
+        ),
+    )
 
 
 def ingest_logs():
+    check_and_rotate_db()
     init_db()
     if not os.path.exists(EVE_LOG_PATH):
         return
+
+    # Loaded once per call; load_rule_catalog is @st.cache_data-decorated in
+    # data_loader.py, so repeated calls across ingestion ticks are cheap.
+    rule_catalog = load_rule_catalog()
 
     conn = _connect()
     cursor = conn.cursor()
     last_offset = get_last_position(conn)
     file_size = os.path.getsize(EVE_LOG_PATH)
     if file_size < last_offset:
-        last_offset = 0  # file was rotated/truncated - restart from the beginning
+        last_offset = 0
 
     alert_count = 0
     traffic_count = 0
@@ -177,7 +266,7 @@ def ingest_logs():
 
             event_type = data.get("event_type")
             if event_type == "alert":
-                _insert_alert(cursor, data)
+                _insert_alert(cursor, data, rule_catalog)
                 alert_count += 1
             elif event_type is not None:
                 _insert_traffic(cursor, data, event_type)
@@ -188,7 +277,6 @@ def ingest_logs():
     conn.commit()
     save_position(conn, new_offset)
 
-    # Cap traffic table growth - it's persisted to disk now, so it needs a retention limit
     cursor.execute("SELECT COUNT(*) FROM traffic")
     traffic_total = cursor.fetchone()[0]
     if traffic_total > MAX_TRAFFIC_ROWS:

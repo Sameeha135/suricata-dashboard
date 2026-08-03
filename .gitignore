@@ -5,3 +5,5 @@ alerts.db
 eve_offset.txt
 .streamlit/secrets.toml
 .streamlit/
+# Ignore large generated JSON rule files
+*.json

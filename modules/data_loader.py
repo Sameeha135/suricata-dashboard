@@ -1,121 +1,48 @@
-import os
 import json
-import pandas as pd
+import os
 import streamlit as st
-from modules import alert_store
 
-EVE_JSON_PATH = "/var/log/suricata/eve.json"
-MAX_TRAFFIC_EVENTS = 3000  # traffic stays session-only rolling window - alerts now persist in SQLite instead
-OFFSET_CACHE_FILE = "eve_offset.txt"
+COMMON_FIELDS = {
+    "sid", "rev", "msg", "classtype", "action", "protocol", "src_net",
+    "src_port", "direction", "dst_net", "dst_port", "ruleset", "vendor",
+    "flow", "flowbits", "references", "rule_metadata",
+}
 
+def _load_and_trim(filename):
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(base_dir, "..", filename) if not os.path.isabs(filename) else filename
 
-def load_raw_events(path=EVE_JSON_PATH):
-    """Reads new lines from eve.json. Alerts are written straight into the
-    persistent SQLite store (survives browser reload / VM restart). Traffic
-    events (flow/stats/dns/etc) go into a session-only rolling window since
-    they're high-volume and not worth persisting forever."""
+    if not os.path.exists(path):
+        path = filename
 
-    if "eve_offset" not in st.session_state:
-        if os.path.exists(OFFSET_CACHE_FILE):
-            try:
-                with open(OFFSET_CACHE_FILE, "r") as f:
-                    st.session_state.eve_offset = int(f.read().strip())
-            except (ValueError, FileNotFoundError):
-                st.session_state.eve_offset = os.path.getsize(path)
-        else:
-            st.session_state.eve_offset = os.path.getsize(path)
-
-    if "traffic_events" not in st.session_state:
-        st.session_state.traffic_events = []
+    if not os.path.exists(path):
+        print(f"[INFO] Rule file '{filename}' not found. Skipping UI enrichment for this file.")
+        return {}
 
     try:
-        with open(path, "r", encoding="utf-8", errors="ignore") as f:
-            f.seek(st.session_state.eve_offset)
-            new_lines = f.readlines()
-            st.session_state.eve_offset = f.tell()
-            with open(OFFSET_CACHE_FILE, "w") as f_off:
-                f_off.write(str(st.session_state.eve_offset))
-    except FileNotFoundError:
-        return st.session_state.traffic_events
-    except PermissionError:
-        st.error(f"Permission denied reading {path}. Check user group permissions.")
-        return st.session_state.traffic_events
+        with open(path, "r", encoding="utf-8") as f:
+            rules = json.load(f)
+    except Exception as e:
+        print(f"[ERROR] Failed to load JSON from '{filename}': {e}")
+        return {}
 
-    for line in new_lines:
-        line = line.strip()
-        if not line:
+    trimmed = {}
+    for r in rules:
+        sid = r.get("sid")
+        if sid is None:
             continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-
-        if event.get("event_type") == "alert":
-            alert_store.insert_alert(event)
-        else:
-            st.session_state.traffic_events.append(event)
-
-    if len(st.session_state.traffic_events) > MAX_TRAFFIC_EVENTS:
-        st.session_state.traffic_events = st.session_state.traffic_events[-MAX_TRAFFIC_EVENTS:]
-
-    return st.session_state.traffic_events
-
-
-def _safe_get(d, *keys, default=None):
-    cur = d
-    for k in keys:
-        if isinstance(cur, dict) and k in cur:
-            cur = cur[k]
-        else:
-            return default
-    return cur
-
-
-def get_traffic_df(events):
-    rows = []
-    for e in events:
-        etype = e.get("event_type")
-        if etype in (None, "alert"):
-            continue
-
-        row = {
-            "timestamp": e.get("timestamp"),
-            "event_type": etype,
-            "src_ip": e.get("src_ip"),
-            "src_port": e.get("src_port"),
-            "dest_ip": e.get("dest_ip"),
-            "dest_port": e.get("dest_port"),
-            "proto": e.get("proto"),
-            "app_proto": e.get("app_proto"),
-            "in_iface": e.get("in_iface"),
-            "flow_id": e.get("flow_id"),
-            "direction": e.get("direction"),
-            "bytes_toserver": _safe_get(e, "flow", "bytes_toserver"),
-            "bytes_toclient": _safe_get(e, "flow", "bytes_toclient"),
-            "raw": e,
-        }
-
-        if etype == "stats":
-            stats = e.get("stats", {})
-            row["uptime_sec"] = stats.get("uptime")
-            row["packets_captured"] = _safe_get(stats, "capture", "kernel_packets")
-            row["packets_dropped"] = _safe_get(stats, "capture", "kernel_drops")
-            row["decoder_pkts"] = _safe_get(stats, "decoder", "pkts")
-            row["decoder_bytes"] = _safe_get(stats, "decoder", "bytes")
-
-        rows.append(row)
-
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    return df
+        trimmed[str(sid)] = {k: v for k, v in r.items() if k in COMMON_FIELDS}
+    return trimmed
 
 
 @st.cache_data
-def load_rule_catalog(path="suricata_et_rules.json"):
-    try:
-        with open(path, "r") as f:
-            rules = json.load(f)
-        return {r["sid"]: r for r in rules}
-    except FileNotFoundError:
-        return {}
+def load_rule_catalog(
+    et_path="suricata_et_rules.json",
+    community_path="suricata_community_sample.json",
+):
+    catalog = {}
+    catalog.update(_load_and_trim(et_path))
+    catalog.update(_load_and_trim(community_path))
+
+    print(f"[DEBUG] Total SIDs loaded into catalog: {len(catalog)}")
+    return catalog

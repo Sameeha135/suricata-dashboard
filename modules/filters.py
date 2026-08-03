@@ -76,7 +76,10 @@ def sidebar_alert_filters(df):
         sig_severities = sorted(df["signature_severity"].dropna().unique().tolist()) if "signature_severity" in df else []
         selected_sig_sev = _synced_multiselect("Signature Severity", sig_severities, "alert_sigsev_filter", container=st)
 
-        confidences = sorted(df["confidence"].dropna().unique().tolist()) if "confidence" in df else []
+        # Update this block to include standard confidence options
+        standard_confidences = ["High", "Medium", "Low"]
+        existing_confidences = df["confidence"].dropna().unique().tolist() if "confidence" in df else []
+        confidences = sorted(list(set(standard_confidences + existing_confidences)))
         selected_confidence = _synced_multiselect("Confidence", confidences, "alert_conf_filter", container=st)
 
         targets = sorted(df["attack_target"].dropna().unique().tolist()) if "attack_target" in df else []
