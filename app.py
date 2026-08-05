@@ -25,9 +25,14 @@ st.set_page_config(page_title="Suricata Monitor", layout="wide")
 st.markdown(
     """
 <style>
-    /* Broadened from just stFragment - stDataFrame, stVerticalBlock, and
-       stElementContainer all get their own fade/dim treatment during
-       fragment reruns, which the narrower selector wasn't catching. */
+    /* Force standard arrow mouse pointer across all Plotly charts */
+    div[data-testid="stPlotlyChart"],
+    div[data-testid="stPlotlyChart"] .main-svg,
+    div[data-testid="stPlotlyChart"] .draglayer,
+    div[data-testid="stPlotlyChart"] .nsewdrag {
+        cursor: default !important;
+    }
+
     div[data-testid="stFragment"],
     div[data-testid="stDataFrame"],
     div[data-testid="stVerticalBlock"],
@@ -70,21 +75,6 @@ st.markdown(
     .sev-low { background-color: rgba(80,140,220,0.25); color: #7fb2ff; }
     .sev-unknown { background-color: rgba(150,150,150,0.2); color: #bbbbbb; }
 
-    div[role="radiogroup"] {
-        gap: 4px;
-    }
-    div[role="radiogroup"] label {
-        background-color: rgba(255,255,255,0.03);
-        border: 1px solid rgba(255,255,255,0.08);
-        border-radius: 8px 8px 0 0;
-        padding: 8px 20px;
-        margin-bottom: 0px;
-    }
-    div[role="radiogroup"] label:has(input:checked) {
-        background-color: rgba(80,140,220,0.15);
-        border-bottom: 2px solid #7fb2ff;
-    }
-
     h1 a, h2 a, h3 a, h4 a, h5 a, h6 a,
     a.stAnchorLink,
     span[data-testid="stHeaderAnchor"] {
@@ -106,17 +96,25 @@ def get_cached_rule_catalog():
     return load_rule_catalog()
 
 
+def get_single_rule_info(sid):
+    if not sid:
+        return None
+    catalog = get_cached_rule_catalog()
+    try:
+        sid_key = str(int(sid))
+    except (ValueError, TypeError):
+        sid_key = str(sid)
+    return catalog.get(sid_key)
+
+
 def sanitize_rule_text(text):
     if not text:
         return ""
     emoji_pattern = re.compile(
-        r"[\U00010000-\U0010ffff]"
-        r"|[\u2600-\u27BF]"
-        r"|[\U0001f300-\U0001f9ff]"
-        r"|[🐾🚨🥱]",
+        r"[\U00010000-\U0010ffff]|[\u2600-\u27BF]|[\U0001f300-\U0001f9ff]|[🐾🚨🥱]",
         flags=re.UNICODE,
     )
-    cleaned = emoji_pattern.sub("", text)
+    cleaned = emoji_pattern.sub("", str(text))
     cleaned = re.sub(r"\s*-\s*-\s*", " - ", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned)
     return cleaned.strip(" -")
@@ -151,6 +149,46 @@ def _write_if_present(container, label, value, code_format=False):
         container.write(f"**{label}:** {value}")
 
 
+def _paginate(df, state_key_prefix, default_rows=25):
+    total = len(df)
+    if total == 0:
+        return df, 0, 1, 1
+
+    col_a, col_b, col_c = st.columns([2, 2, 4])
+
+    with col_a:
+        page_size_choice = st.selectbox(
+            "Rows per page",
+            [25, 50, 100, 250, "All"],
+            index=0,
+            key=f"{state_key_prefix}_page_size",
+        )
+
+    if page_size_choice == "All":
+        return df, total, 1, 1
+
+    page_size = int(page_size_choice)
+    total_pages = max(1, (total - 1) // page_size + 1)
+
+    with col_b:
+        current_page = st.number_input(
+            "Page",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            step=1,
+            key=f"{state_key_prefix}_page_num",
+        )
+    current_page = min(max(1, int(current_page)), total_pages)
+
+    with col_c:
+        st.caption(f"Showing page {current_page} of {total_pages} ({total} total rows)")
+
+    start = (current_page - 1) * page_size
+    end = start + page_size
+    return df.iloc[start:end], total, current_page, total_pages
+
+
 def _maybe_ingest():
     now = time.time()
     last = st.session_state.get("_last_ingest_time", 0)
@@ -163,44 +201,59 @@ def _maybe_ingest():
 
 
 @st.cache_data(ttl=5)
-def load_alerts_from_db(include_reviewed=False):
-    conn = sqlite3.connect("alerts.db")
+def load_alerts_from_db(include_reviewed=False, fetch_limit=500):
     try:
+        conn = sqlite3.connect("alerts.db", timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         query = "SELECT * FROM alerts"
         if not include_reviewed:
             query += " WHERE status = 'new'"
-        query += " ORDER BY timestamp DESC"
+        query += f" ORDER BY timestamp DESC LIMIT {fetch_limit}"
         df = pd.read_sql_query(query, conn)
+    except Exception:
+        df = pd.DataFrame()
     finally:
-        conn.close()
+        if "conn" in locals():
+            conn.close()
 
-    if not df.empty:
-        if "timestamp" in df.columns:
-            df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-        if "raw_json" in df.columns:
-            df["raw"] = df["raw_json"].apply(
-                lambda x: sanitize_json_data(json.loads(x)) if x else {}
-            )
-        if "enrichment_json" in df.columns:
-            df["enrichment"] = df["enrichment_json"].apply(
-                lambda x: json.loads(x) if isinstance(x, str) and x.strip() else None
-            )
+    if not df.empty and "timestamp" in df.columns:
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
     return df
 
 
-@st.cache_data(ttl=5)
-def load_traffic_from_db():
-    conn = sqlite3.connect("alerts.db")
+def _get_parsed_raw(row):
+    x = row.get("raw_json")
+    if not x or (isinstance(x, float) and pd.isna(x)):
+        return {}
     try:
+        return sanitize_json_data(json.loads(x))
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
+def _get_parsed_enrichment(row):
+    x = row.get("enrichment_json")
+    if not isinstance(x, str) or not x.strip():
+        return None
+    try:
+        return json.loads(x)
+    except json.JSONDecodeError:
+        return None
+
+
+@st.cache_data(ttl=5)
+def load_traffic_from_db(fetch_limit=1000):
+    try:
+        conn = sqlite3.connect("alerts.db", timeout=10.0)
         conn.execute("PRAGMA journal_mode=WAL;")
         df = pd.read_sql_query(
-            "SELECT * FROM traffic ORDER BY timestamp DESC LIMIT 2000", conn
+            f"SELECT * FROM traffic ORDER BY timestamp DESC LIMIT {fetch_limit}", conn
         )
     except Exception:
         df = pd.DataFrame()
     finally:
-        conn.close()
+        if "conn" in locals():
+            conn.close()
 
     if not df.empty and "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -221,7 +274,8 @@ def _format_local(ts_series, use_12hr):
 def _format_single_ts(ts, use_12hr):
     if pd.isna(ts):
         return "N/A"
-    ts_obj = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+    ts_obj = pd.to_datetime(ts)
+    ts_obj = ts_obj.tz_localize("UTC") if ts_obj.tzinfo is None else ts_obj
     local_ts = ts_obj.tz_convert(LOCAL_TZ)
     fmt = "%Y-%m-%d %I:%M:%S %p" if use_12hr else "%Y-%m-%d %H:%M:%S"
     return local_ts.strftime(fmt)
@@ -237,155 +291,153 @@ def _sev_chip_class(sev_label):
         return "sev-low"
 
 
-@st.fragment(run_every=30)
-def render_dashboard():
-    _maybe_ingest()
-    rule_catalog = get_cached_rule_catalog()
+@st.fragment
+def render_alerts_table_and_details(filtered_alerts, use_12hr):
+    """Renders only the table and detail panel.
 
-    traffic_df = load_traffic_from_db()
+    Row selections here will NOT trigger chart re-renders.
+    """
+    t_frag_start = time.perf_counter()
 
-    use_12hr = st.sidebar.checkbox(
-        "Use 12-hour clock (AM/PM)", value=False, key="use_12hr_toggle"
-    )
-    show_reviewed = st.sidebar.checkbox(
-        "Show reviewed / false-positive alerts",
-        value=False,
-        key="show_reviewed_toggle",
-    )
-    st.sidebar.divider()
-
-    alerts_df = load_alerts_from_db(include_reviewed=show_reviewed)
-
-    kpi_row(alerts_df, traffic_df)
-    st.divider()
-
-    active_tab = st.radio(
-        "View",
-        ["Alerts", "Traffic"],
-        horizontal=True,
-        key="active_tab_selector",
-        label_visibility="collapsed",
+    sort_option = st.selectbox(
+        "Sort by",
+        [
+            "Most urgent first (severity)",
+            "Newest first",
+            "Oldest first",
+            "Confidence (High to Low)",
+        ],
+        key="alert_sort_option",
     )
 
-    if active_tab == "Alerts":
-        filtered_alerts = sidebar_alert_filters(alerts_df)
-
-        if not filtered_alerts.empty and "signature" in filtered_alerts.columns:
-            filtered_alerts["signature"] = filtered_alerts["signature"].apply(
-                sanitize_rule_text
-            )
-
-        sort_option = st.selectbox(
-            "Sort by",
-            [
-                "Most urgent first (severity)",
-                "Newest first",
-                "Oldest first",
-                "Confidence (High to Low)",
-            ],
-            key="alert_sort_option",
-        )
-        if sort_option == "Most urgent first (severity)" and not filtered_alerts.empty:
+    if not filtered_alerts.empty:
+        if sort_option == "Most urgent first (severity)":
             filtered_alerts = filtered_alerts.sort_values(
                 "severity", ascending=True, na_position="last"
             )
         elif sort_option == "Newest first":
-            filtered_alerts = filtered_alerts.sort_values("timestamp", ascending=False)
+            filtered_alerts = filtered_alerts.sort_values(
+                "timestamp", ascending=False
+            )
         elif sort_option == "Oldest first":
-            filtered_alerts = filtered_alerts.sort_values("timestamp", ascending=True)
-        elif sort_option == "Confidence (High to Low)" and not filtered_alerts.empty:
+            filtered_alerts = filtered_alerts.sort_values(
+                "timestamp", ascending=True
+            )
+        elif sort_option == "Confidence (High to Low)":
             conf_rank = {"High": 0, "Medium": 1, "Low": 2}
             filtered_alerts = filtered_alerts.assign(
-                _conf_rank=filtered_alerts["confidence"].map(conf_rank).fillna(3)
+                _conf_rank=filtered_alerts["confidence"]
+                .map(conf_rank)
+                .fillna(3)
             ).sort_values("_conf_rank").drop(columns="_conf_rank")
 
-        group_mode = st.checkbox(
-            "Group similar alerts by Signature & Source IP",
-            value=False,
-            key="group_alerts_toggle",
+    group_mode = st.checkbox(
+        "Group similar alerts by Signature & Source IP",
+        value=False,
+        key="group_alerts_toggle",
+    )
+
+    if group_mode and not filtered_alerts.empty:
+        st.subheader(
+            f"Grouped Alert Summary ({len(filtered_alerts)} total events aggregated)"
         )
 
-        if group_mode and not filtered_alerts.empty:
-            st.subheader(
-                f"Grouped Alert Summary ({len(filtered_alerts)} total events aggregated)"
+        grouped_df = (
+            filtered_alerts.groupby(
+                ["signature", "signature_id", "severity", "src_ip"],
+                dropna=False,
+            )
+            .agg(
+                count=("id", "count"),
+                first_seen=("timestamp", "min"),
+                last_seen=("timestamp", "max"),
+                sample_dest=("dest_ip", "first"),
+            )
+            .reset_index()
+            .sort_values(by="count", ascending=False)
+        )
+
+        grouped_page, _, _, _ = _paginate(
+            grouped_df, "grouped_alerts", default_rows=25
+        )
+
+        for _, group_row in grouped_page.iterrows():
+            sev_label = {1: "High", 2: "Medium", 3: "Low"}.get(
+                group_row["severity"], "Unknown"
+            )
+            chip_class = _sev_chip_class(sev_label)
+            clean_sig = sanitize_rule_text(group_row["signature"])
+
+            first_seen_str = _format_single_ts(
+                group_row["first_seen"], use_12hr
+            )
+            last_seen_str = _format_single_ts(group_row["last_seen"], use_12hr)
+
+            with st.expander(
+                f"[{group_row['count']} events] {sev_label} | {clean_sig} | Src: {group_row['src_ip']}"
+            ):
+                st.markdown(
+                    f'<span class="sev-chip {chip_class}">{sev_label}</span>'
+                    f' **Total Occurrences:** `{group_row["count"]}`',
+                    unsafe_allow_html=True,
+                )
+                st.write(
+                    f"**Signature ID (SID):** {group_row['signature_id']}  |"
+                    f" **Source IP:** {group_row['src_ip']}"
+                )
+                st.write(
+                    f"**First Seen:** {first_seen_str}  | **Last Seen:** {last_seen_str}"
+                )
+
+    else:
+        st.subheader(
+            f"Live Alert Stream ({len(filtered_alerts)} loaded in view)"
+        )
+
+        if not filtered_alerts.empty:
+            export_df = filtered_alerts.drop(
+                columns=["raw_json", "enrichment_json"], errors="ignore"
+            )
+            st.download_button(
+                "Download filtered alerts as CSV",
+                export_df.to_csv(index=False).encode("utf-8"),
+                "alerts_export.csv",
+                "text/csv",
+                key="alerts_csv_dl",
             )
 
-            grouped_df = (
-                filtered_alerts.groupby(
-                    ["signature", "signature_id", "severity", "src_ip"]
-                )
-                .agg(
-                    count=("id", "count"),
-                    first_seen=("timestamp", "min"),
-                    last_seen=("timestamp", "max"),
-                    sample_dest=("dest_ip", "first"),
-                )
-                .reset_index()
-                .sort_values(by="count", ascending=False)
+            st.caption(
+                "Click on any alert row below to open its full details, rule descriptions, raw JSON, and review actions."
             )
 
-            for _, group_row in grouped_df.iterrows():
-                sev_label = {1: "High", 2: "Medium", 3: "Low"}.get(
-                    group_row["severity"], "Unknown"
+            page_df, total_rows, current_page, total_pages = _paginate(
+                filtered_alerts, "alerts_table", default_rows=25
+            )
+
+            if not page_df.empty:
+                display_df = pd.DataFrame()
+                display_df["id"] = page_df["id"]
+                display_df["SID"] = page_df["signature_id"]
+                display_df["Formatted_Time"] = _format_local(
+                    page_df["timestamp"], use_12hr
                 )
-                chip_class = _sev_chip_class(sev_label)
-
-                first_seen_str = _format_single_ts(group_row["first_seen"], use_12hr)
-                last_seen_str = _format_single_ts(group_row["last_seen"], use_12hr)
-
-                with st.expander(
-                    f"[{group_row['count']} events] {sev_label} |"
-                    f" {group_row['signature']} | Src: {group_row['src_ip']}"
-                ):
-                    st.markdown(
-                        f'<span class="sev-chip {chip_class}">{sev_label}</span>'
-                        f' **Total Occurrences:** `{group_row["count"]}`',
-                        unsafe_allow_html=True,
-                    )
-                    st.write(
-                        f"**Signature ID (SID):** {group_row['signature_id']}  |"
-                        f" **Source IP:** {group_row['src_ip']}"
-                    )
-                    st.write(
-                        f"**First Seen:** {first_seen_str}  | **Last Seen:** {last_seen_str}"
-                    )
-
-        else:
-            st.subheader(f"Live Alert Stream ({len(filtered_alerts)} matching)")
-
-            if not filtered_alerts.empty:
-                export_df = filtered_alerts.drop(
-                    columns=["raw", "raw_json", "enrichment", "enrichment_json"],
-                    errors="ignore",
+                display_df["Severity"] = (
+                    page_df["severity"]
+                    .map({1: "High", 2: "Medium", 3: "Low"})
+                    .fillna("Unknown")
                 )
-                st.download_button(
-                    "Download filtered alerts as CSV",
-                    export_df.to_csv(index=False).encode("utf-8"),
-                    "alerts_export.csv",
-                    "text/csv",
-                    key="alerts_csv_dl",
+                display_df["signature"] = page_df["signature"].apply(
+                    sanitize_rule_text
                 )
+                display_df["src_ip"] = page_df["src_ip"]
+                display_df["dest_ip"] = page_df["dest_ip"]
+                display_df["status"] = page_df["status"]
 
-                st.caption(
-                    "Click on any alert row below to open its full details,"
-                    " rule descriptions, raw JSON, and review actions."
-                )
-
-                table_df = filtered_alerts.copy()
-                table_df["Formatted_Time"] = _format_local(table_df["timestamp"], use_12hr)
-                table_df["Severity"] = (
-                    table_df["severity"].map({1: "High", 2: "Medium", 3: "Low"}).fillna("Unknown")
-                )
-                table_df["SID"] = table_df["signature_id"]
-
-                display_columns = [
-                    "SID", "Formatted_Time", "Severity", "signature", "src_ip", "dest_ip", "status",
-                ]
-                available_cols = [c for c in display_columns if c in table_df.columns]
+                view_df = display_df.drop(columns=["id"])
 
                 event = st.dataframe(
-                    table_df[available_cols],
-                    use_container_width=True,
+                    view_df,
+                    width="stretch",
                     key="alerts_table_view",
                     selection_mode="single-row",
                     on_select="rerun",
@@ -394,13 +446,25 @@ def render_dashboard():
 
                 selected_rows = event.selection.get("rows", [])
                 if selected_rows:
-                    selected_idx = selected_rows[0]
-                    row = filtered_alerts.iloc[selected_idx]
+                    selected_page_row = display_df.iloc[selected_rows[0]]
+                    selected_id = selected_page_row["id"]
+                    matching = filtered_alerts[
+                        filtered_alerts["id"] == selected_id
+                    ]
+                    row = (
+                        matching.iloc[0]
+                        if not matching.empty
+                        else page_df.iloc[selected_rows[0]]
+                    )
 
                     st.markdown("---")
-                    st.subheader(f"Detailed View for Alert ID: {row.get('id', 'N/A')}")
+                    st.subheader(
+                        f"Detailed View for Alert ID: {row.get('id', 'N/A')}"
+                    )
 
-                    sev_label = {1: "High", 2: "Medium", 3: "Low"}.get(row["severity"], "Unknown")
+                    sev_label = {1: "High", 2: "Medium", 3: "Low"}.get(
+                        row["severity"], "Unknown"
+                    )
                     chip_class = _sev_chip_class(sev_label)
                     st.markdown(
                         f'<span class="sev-chip {chip_class}">{sev_label}</span>',
@@ -417,19 +481,17 @@ def render_dashboard():
 
                     detail_bits = []
                     if not _is_blank(row.get("confidence")):
-                        detail_bits.append(f"**Confidence:** {row['confidence']}")
+                        detail_bits.append(
+                            f"**Confidence:** {row['confidence']}"
+                        )
                     if not _is_blank(row.get("attack_target")):
                         detail_bits.append(f"**Target:** {row['attack_target']}")
                     if detail_bits:
                         st.write("  |  ".join(detail_bits))
 
-                    enrichment = row.get("enrichment")
-                    if not enrichment:
-                        try:
-                            sid_key = str(int(row["signature_id"]))
-                        except (ValueError, TypeError):
-                            sid_key = str(row["signature_id"])
-                        enrichment = rule_catalog.get(sid_key)
+                    enrichment = _get_parsed_enrichment(
+                        row
+                    ) or get_single_rule_info(row["signature_id"])
 
                     has_any_value = enrichment and any(
                         not _is_blank(v) for v in enrichment.values()
@@ -440,68 +502,199 @@ def render_dashboard():
 
                         msg_val = enrichment.get("msg")
                         if not _is_blank(msg_val):
-                            st.write(f"**Rule Message (`msg`):** {sanitize_rule_text(msg_val)}")
+                            st.write(
+                                f"**Rule Message (`msg`):** {sanitize_rule_text(msg_val)}"
+                            )
 
                         col1, col2, col3 = st.columns(3)
 
-                        _write_if_present(col1, "Action", enrichment.get("action"), code_format=True)
-                        _write_if_present(col1, "Classtype", enrichment.get("classtype"), code_format=True)
-                        _write_if_present(col1, "Protocol", enrichment.get("protocol"), code_format=True)
-                        _write_if_present(col1, "Revision (`rev`)", enrichment.get("rev"), code_format=True)
+                        _write_if_present(
+                            col1,
+                            "Action",
+                            enrichment.get("action"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col1,
+                            "Classtype",
+                            enrichment.get("classtype"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col1,
+                            "Protocol",
+                            enrichment.get("protocol"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col1,
+                            "Revision (`rev`)",
+                            enrichment.get("rev"),
+                            code_format=True,
+                        )
 
-                        _write_if_present(col2, "Source Net", enrichment.get("src_net"), code_format=True)
-                        _write_if_present(col2, "Source Port", enrichment.get("src_port"), code_format=True)
-                        _write_if_present(col2, "Direction", enrichment.get("direction"), code_format=True)
-                        _write_if_present(col2, "Dest Net", enrichment.get("dst_net"), code_format=True)
-                        _write_if_present(col2, "Dest Port", enrichment.get("dst_port"), code_format=True)
+                        _write_if_present(
+                            col2,
+                            "Source Net",
+                            enrichment.get("src_net"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col2,
+                            "Source Port",
+                            enrichment.get("src_port"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col2,
+                            "Direction",
+                            enrichment.get("direction"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col2,
+                            "Dest Net",
+                            enrichment.get("dst_net"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col2,
+                            "Dest Port",
+                            enrichment.get("dst_port"),
+                            code_format=True,
+                        )
 
-                        _write_if_present(col3, "Ruleset", enrichment.get("ruleset"), code_format=True)
-                        _write_if_present(col3, "Vendor", enrichment.get("vendor"), code_format=True)
+                        _write_if_present(
+                            col3,
+                            "Ruleset",
+                            enrichment.get("ruleset"),
+                            code_format=True,
+                        )
+                        _write_if_present(
+                            col3,
+                            "Vendor",
+                            enrichment.get("vendor"),
+                            code_format=True,
+                        )
                     else:
-                        st.caption("No extended description available for this SID yet.")
+                        st.caption(
+                            "No extended description available for this SID yet."
+                        )
 
                     st.write("**Full raw event:**")
-                    st.json(row.get("raw", {}))
+                    st.json(_get_parsed_raw(row), expanded=False)
 
                     btn_col1, btn_col2, btn_col3 = st.columns(3)
                     with btn_col1:
                         if row["status"] == "new":
-                            if st.button("Mark Reviewed", key=f"table_review_{row['id']}"):
+                            if st.button(
+                                "Mark Reviewed", key=f"table_review_{row['id']}"
+                            ):
                                 alert_store.update_status(row["id"], "reviewed")
                                 st.rerun()
                     with btn_col2:
                         if row["status"] == "new":
-                            if st.button("Mark False Positive", key=f"table_fp_{row['id']}"):
-                                alert_store.update_status(row["id"], "false_positive")
+                            if st.button(
+                                "Mark False Positive",
+                                key=f"table_fp_{row['id']}",
+                            ):
+                                alert_store.update_status(
+                                    row["id"], "false_positive"
+                                )
                                 st.rerun()
                     with btn_col3:
                         if row["status"] != "new":
                             st.caption(f"Status: {row['status']}")
-                            if st.button("Reopen (mark as new)", key=f"table_reopen_{row['id']}"):
+                            if st.button(
+                                "Reopen (mark as new)",
+                                key=f"table_reopen_{row['id']}",
+                            ):
                                 alert_store.update_status(row["id"], "new")
                                 st.rerun()
 
-        st.divider()
-        st.subheader("Analytics & Trends")
-        col_a, col_b = st.columns(2)
-        with col_a:
-            st.markdown("##### Alerts Over Time")
-            alerts_over_time_chart(filtered_alerts)
-        with col_b:
-            st.markdown("##### Top Signatures")
-            top_signatures_chart(filtered_alerts)
+    t_frag_total = time.perf_counter() - t_frag_start
+    print(f"[TIMING] table_and_details_render={t_frag_total:.2f}s")
 
-        st.markdown("##### Severity Breakdown")
-        severity_breakdown_chart(filtered_alerts)
 
-    else:
+@st.fragment
+def render_alerts_analytics(filtered_alerts):
+    """Renders charts in a separate fragment so row selections don't trigger chart redrawing."""
+    st.divider()
+    st.subheader("Analytics & Trends")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("##### Alerts Over Time")
+        alerts_over_time_chart(filtered_alerts)
+    with col_b:
+        st.markdown("##### Top Signatures")
+        top_signatures_chart(filtered_alerts)
+
+    st.markdown("##### Severity Breakdown")
+    severity_breakdown_chart(filtered_alerts)
+
+
+def render_alerts_tab(alerts_df, use_12hr):
+    filtered_alerts = sidebar_alert_filters(alerts_df)
+
+    # 1. Fast interactive table & detail panel
+    render_alerts_table_and_details(filtered_alerts, use_12hr)
+
+    # 2. Isolated analytics charts
+    render_alerts_analytics(filtered_alerts)
+
+
+def render_dashboard():
+    t_start = time.perf_counter()
+
+    t0 = time.perf_counter()
+    _maybe_ingest()
+    t_ingest = time.perf_counter() - t0
+
+    use_12hr = st.sidebar.checkbox(
+        "Use 12-hour clock (AM/PM)", value=False, key="use_12hr_toggle"
+    )
+    show_reviewed = st.sidebar.checkbox(
+        "Show reviewed / false-positive alerts",
+        value=False,
+        key="show_reviewed_toggle",
+    )
+    fetch_limit = st.sidebar.select_slider(
+        "Max DB Fetch Limit",
+        options=[250, 500, 1000, 2000],
+        value=500,
+        key="db_fetch_limit",
+        help="Lower limits increase dashboard speed.",
+    )
+    st.sidebar.divider()
+
+    t0 = time.perf_counter()
+    alerts_df = load_alerts_from_db(include_reviewed=show_reviewed, fetch_limit=fetch_limit)
+    t_alerts_load = time.perf_counter() - t0
+
+    t0 = time.perf_counter()
+    traffic_df = load_traffic_from_db(fetch_limit=fetch_limit)
+    t_traffic_load = time.perf_counter() - t0
+
+    kpi_row(alerts_df, traffic_df)
+    st.divider()
+
+    selected_tab = st.radio(
+        "Navigation View",
+        ["Alerts", "Traffic"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="main_nav_radio",
+    )
+
+    if selected_tab == "Alerts":
+        render_alerts_tab(alerts_df, use_12hr)
+
+    elif selected_tab == "Traffic":
         filtered_traffic = sidebar_traffic_filters(traffic_df)
 
-        st.subheader(f"Traffic Events ({len(filtered_traffic)} matching)")
+        st.subheader(f"Traffic Events ({len(filtered_traffic)} loaded in view)")
 
         if not filtered_traffic.empty:
-            display_df = filtered_traffic.copy()
-
             base_cols = [
                 "timestamp", "event_type", "src_ip", "src_port",
                 "dest_ip", "dest_port", "proto", "app_proto",
@@ -517,12 +710,12 @@ def render_dashboard():
 
             display_cols = (
                 base_cols
-                + [c for c in optional_cols if c in display_df.columns]
-                + [c for c in stats_cols if c in display_df.columns]
+                + [c for c in optional_cols if c in filtered_traffic.columns]
+                + [c for c in stats_cols if c in filtered_traffic.columns]
             )
 
-            export_df = display_df[
-                [c for c in display_cols if c in display_df.columns]
+            export_df = filtered_traffic[
+                [c for c in display_cols if c in filtered_traffic.columns]
             ].drop(columns=["raw"], errors="ignore")
 
             st.download_button(
@@ -533,16 +726,21 @@ def render_dashboard():
                 key="traffic_csv_dl",
             )
 
-            display_df["timestamp"] = _format_local(display_df["timestamp"], use_12hr)
-
-            st.dataframe(
-                display_df[[c for c in display_cols if c in display_df.columns]].sort_values(
-                    "timestamp", ascending=False
-                ),
-                use_container_width=True,
-                key="traffic_table",
-                hide_index=True,
+            page_df, total_rows, current_page, total_pages = _paginate(
+                filtered_traffic, "traffic_table", default_rows=25
             )
+
+            if not page_df.empty:
+                page_display = page_df[[c for c in display_cols if c in page_df.columns]].copy()
+                page_display["timestamp"] = _format_local(page_display["timestamp"], use_12hr)
+                page_display = page_display.sort_values("timestamp", ascending=False)
+
+                st.dataframe(
+                    page_display,
+                    width="stretch",
+                    key="traffic_table",
+                    hide_index=True,
+                )
 
         st.divider()
         st.subheader("Traffic Analytics")
@@ -556,6 +754,13 @@ def render_dashboard():
 
         st.markdown("##### Protocol Distribution")
         protocol_distribution_chart(filtered_traffic)
+
+    t_total = time.perf_counter() - t_start
+    print(
+        f"[TIMING] ingest={t_ingest:.2f}s "
+        f"alerts_load={t_alerts_load:.2f}s traffic_load={t_traffic_load:.2f}s "
+        f"TOTAL={t_total:.2f}s"
+    )
 
 
 render_dashboard()
