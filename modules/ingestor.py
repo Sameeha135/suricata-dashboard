@@ -12,9 +12,12 @@ MAX_TRAFFIC_ROWS = 5000
 MAX_ALERT_ROWS_BEFORE_ROTATE = 25000
 
 
+
+
 def _connect(db_path=DB_PATH):
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(db_path, timeout=30.0)
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 
@@ -238,12 +241,12 @@ def ingest_logs():
     if not os.path.exists(EVE_LOG_PATH):
         return
 
-    # Loaded once per call; load_rule_catalog is @st.cache_data-decorated in
-    # data_loader.py, so repeated calls across ingestion ticks are cheap.
     rule_catalog = load_rule_catalog()
 
     conn = _connect()
+    conn.execute("PRAGMA synchronous = OFF;")
     cursor = conn.cursor()
+    
     last_offset = get_last_position(conn)
     file_size = os.path.getsize(EVE_LOG_PATH)
     if file_size < last_offset:
@@ -251,47 +254,116 @@ def ingest_logs():
 
     alert_count = 0
     traffic_count = 0
-    new_offset = last_offset
+    batch_count = 0
 
-    with open(EVE_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
-        f.seek(last_offset)
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                data = json.loads(line)
-            except json.JSONDecodeError:
-                continue
+    try:
+        with open(EVE_LOG_PATH, "r", encoding="utf-8", errors="ignore") as f:
+            f.seek(last_offset)
+            
+            conn.execute("BEGIN TRANSACTION;")
+            while True:
+                line = f.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
 
-            event_type = data.get("event_type")
-            if event_type == "alert":
-                _insert_alert(cursor, data, rule_catalog)
-                alert_count += 1
-            elif event_type is not None:
-                _insert_traffic(cursor, data, event_type)
-                traffic_count += 1
+                event_type = data.get("event_type")
+                if event_type == "alert":
+                    _insert_alert(cursor, data, rule_catalog)
+                    alert_count += 1
+                    batch_count += 1
+                elif event_type is not None:
+                    _insert_traffic(cursor, data, event_type)
+                    traffic_count += 1
+                    batch_count += 1
 
-        new_offset = f.tell()
+                # Commit every 500 records to release write lock briefly
+                if batch_count >= 500:
+                    new_offset = f.tell()
+                    save_position(conn, new_offset)
+                    conn.commit()
+                    conn.execute("BEGIN TRANSACTION;")
+                    batch_count = 0
 
-    conn.commit()
-    save_position(conn, new_offset)
+            new_offset = f.tell()
+            save_position(conn, new_offset)
+            conn.commit()
 
-    cursor.execute("SELECT COUNT(*) FROM traffic")
-    traffic_total = cursor.fetchone()[0]
-    if traffic_total > MAX_TRAFFIC_ROWS:
-        cursor.execute("""
-            DELETE FROM traffic WHERE id NOT IN (
-                SELECT id FROM traffic ORDER BY id DESC LIMIT ?
-            )
-        """, (MAX_TRAFFIC_ROWS,))
-        conn.commit()
+        cursor.execute("SELECT COUNT(*) FROM traffic")
+        traffic_total = cursor.fetchone()[0]
+        if traffic_total > MAX_TRAFFIC_ROWS:
+            cursor.execute("""
+                DELETE FROM traffic WHERE id NOT IN (
+                    SELECT id FROM traffic ORDER BY id DESC LIMIT ?
+                )
+            """, (MAX_TRAFFIC_ROWS,))
+            conn.commit()
 
-    conn.close()
+    finally:
+        conn.close()
 
     if alert_count or traffic_count:
         print(f"Ingested {alert_count} alerts and {traffic_count} traffic events into SQLite.")
 
+# --- Add these functions to the bottom of ingestor.py ---
+
+def get_alerts_page(limit=50, offset=0, status_filter=None):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    query = "SELECT * FROM alerts"
+    params = []
+    
+    if status_filter and status_filter != "All":
+        query += " WHERE status = ?"
+        params.append(status_filter)
+        
+    query += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
+    
+    cursor.execute(query, params)
+    rows = [dict(row) for row in cursor.fetchall()]
+    
+    # Get total count for pagination controls
+    count_query = "SELECT COUNT(*) FROM alerts"
+    if status_filter and status_filter != "All":
+        count_query += " WHERE status = ?"
+        cursor.execute(count_query, (status_filter,))
+    else:
+        cursor.execute(count_query)
+    total_count = cursor.fetchone()[0]
+    
+    conn.close()
+    return rows, total_count
+
+
+def get_single_alert_details(alert_id):
+    conn = _connect()
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute("SELECT raw_json, enrichment_json FROM alerts WHERE id = ?", (alert_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if not row:
+        return None, None
+        
+    raw_payload = row["raw_json"]
+    try:
+        parsed = json.loads(raw_payload)
+        formatted_json = json.dumps(parsed, indent=2)
+    except Exception:
+        formatted_json = raw_payload
+        
+    enrichment = json.loads(row["enrichment_json"]) if row["enrichment_json"] else {}
+    return formatted_json, enrichment
 
 if __name__ == "__main__":
     ingest_logs()

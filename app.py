@@ -2,9 +2,14 @@ import json
 import re
 import sqlite3
 import time
+import threading
+from contextlib import contextmanager
 from zoneinfo import ZoneInfo
 import pandas as pd
 import streamlit as st
+
+INGEST_LOCK = threading.Lock()
+_LAST_GLOBAL_INGEST_TIME = 0.0
 
 from modules import alert_store
 from modules.charts import (
@@ -80,18 +85,25 @@ st.markdown(
     span[data-testid="stHeaderAnchor"] {
         display: none !important;
     }
+    /* Hide Streamlit background execution toasts and spinners */
+    div[data-testid="stStatusWidget"],
+    div[data-testid="stNotification"],
+    .stSpinner {
+        display: none !important;
+    }
 </style>
 """,
+
     unsafe_allow_html=True,
 )
 
 st.title("Suricata Monitoring Dashboard")
 
 LOCAL_TZ = ZoneInfo("Asia/Karachi")
-INGEST_INTERVAL_SECONDS = 15
+INGEST_INTERVAL_SECONDS = 2  # CHANGE 1: Reduced throttle from 15s to 2s
 
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=3600)
 def get_cached_rule_catalog():
     return load_rule_catalog()
 
@@ -107,16 +119,21 @@ def get_single_rule_info(sid):
     return catalog.get(sid_key)
 
 
+# Compile regex patterns once globally at module startup
+EMOJI_PATTERN = re.compile(
+    r"[\U00010000-\U0010ffff]|[\u2600-\u27BF]|[\U0001f300-\U0001f9ff]|[🐾🚨🥱]",
+    flags=re.UNICODE,
+)
+DASH_PATTERN = re.compile(r"\s*-\s*-\s*")
+WHITESPACE_PATTERN = re.compile(r"\s+")
+
+
 def sanitize_rule_text(text):
     if not text:
         return ""
-    emoji_pattern = re.compile(
-        r"[\U00010000-\U0010ffff]|[\u2600-\u27BF]|[\U0001f300-\U0001f9ff]|[🐾🚨🥱]",
-        flags=re.UNICODE,
-    )
-    cleaned = emoji_pattern.sub("", str(text))
-    cleaned = re.sub(r"\s*-\s*-\s*", " - ", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = EMOJI_PATTERN.sub("", str(text))
+    cleaned = DASH_PATTERN.sub(" - ", cleaned)
+    cleaned = WHITESPACE_PATTERN.sub(" ", cleaned)
     return cleaned.strip(" -")
 
 
@@ -189,32 +206,54 @@ def _paginate(df, state_key_prefix, default_rows=25):
     return df.iloc[start:end], total, current_page, total_pages
 
 
+def _background_ingest():
+    """Runs ingestion in a background thread to prevent UI freezing."""
+    try:
+        ingest_logs()
+    except Exception as e:
+        print(f"[ERROR] Background ingestion failed: {e}")
+    finally:
+        if INGEST_LOCK.locked():
+            INGEST_LOCK.release()
+
+
 def _maybe_ingest():
+    global _LAST_GLOBAL_INGEST_TIME
     now = time.time()
-    last = st.session_state.get("_last_ingest_time", 0)
-    if now - last >= INGEST_INTERVAL_SECONDS:
-        try:
-            ingest_logs()
-        except Exception as e:
-            st.error(f"Ingestion error: {e}")
-        st.session_state["_last_ingest_time"] = now
+
+    # 1. Enforce global interval across all tabs/sessions
+    if now - _LAST_GLOBAL_INGEST_TIME < INGEST_INTERVAL_SECONDS:
+        return
+
+    # 2. Acquire lock non-blockingly; if another thread is already ingesting, skip
+    if INGEST_LOCK.acquire(blocking=False):
+        _LAST_GLOBAL_INGEST_TIME = now
+        threading.Thread(target=_background_ingest, daemon=True).start()
 
 
-@st.cache_data(ttl=5)
+@contextmanager
+def get_db_connection():
+    """Context manager for SQLite connections with WAL mode enabled."""
+    conn = sqlite3.connect("alerts.db", timeout=30.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=30000;")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+@st.cache_data(ttl=1, show_spinner=False)
 def load_alerts_from_db(include_reviewed=False, fetch_limit=500):
     try:
-        conn = sqlite3.connect("alerts.db", timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        query = "SELECT * FROM alerts"
-        if not include_reviewed:
-            query += " WHERE status = 'new'"
-        query += f" ORDER BY timestamp DESC LIMIT {fetch_limit}"
-        df = pd.read_sql_query(query, conn)
+        with get_db_connection() as conn:
+            query = "SELECT * FROM alerts"
+            if not include_reviewed:
+                query += " WHERE status = 'new'"
+            query += f" ORDER BY timestamp DESC LIMIT {fetch_limit}"
+            df = pd.read_sql_query(query, conn)
     except Exception:
         df = pd.DataFrame()
-    finally:
-        if "conn" in locals():
-            conn.close()
 
     if not df.empty and "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -226,7 +265,7 @@ def _get_parsed_raw(row):
     if not x or (isinstance(x, float) and pd.isna(x)):
         return {}
     try:
-        return sanitize_json_data(json.loads(x))
+        return json.loads(x)
     except (json.JSONDecodeError, TypeError):
         return {}
 
@@ -241,19 +280,15 @@ def _get_parsed_enrichment(row):
         return None
 
 
-@st.cache_data(ttl=5)
+@st.cache_data(ttl=5, show_spinner=False)
 def load_traffic_from_db(fetch_limit=1000):
     try:
-        conn = sqlite3.connect("alerts.db", timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL;")
-        df = pd.read_sql_query(
-            f"SELECT * FROM traffic ORDER BY timestamp DESC LIMIT {fetch_limit}", conn
-        )
+        with get_db_connection() as conn:
+            df = pd.read_sql_query(
+                f"SELECT * FROM traffic ORDER BY timestamp DESC LIMIT {fetch_limit}", conn
+            )
     except Exception:
         df = pd.DataFrame()
-    finally:
-        if "conn" in locals():
-            conn.close()
 
     if not df.empty and "timestamp" in df.columns:
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
@@ -291,12 +326,8 @@ def _sev_chip_class(sev_label):
         return "sev-low"
 
 
-@st.fragment
 def render_alerts_table_and_details(filtered_alerts, use_12hr):
-    """Renders only the table and detail panel.
-
-    Row selections here will NOT trigger chart re-renders.
-    """
+    """Renders only the table and detail panel."""
     t_frag_start = time.perf_counter()
 
     sort_option = st.selectbox(
@@ -616,9 +647,20 @@ def render_alerts_table_and_details(filtered_alerts, use_12hr):
     print(f"[TIMING] table_and_details_render={t_frag_total:.2f}s")
 
 
-@st.fragment
-def render_alerts_analytics(filtered_alerts):
-    """Renders charts in a separate fragment so row selections don't trigger chart redrawing."""
+@st.fragment(run_every="2s")
+def render_live_alerts_section(include_reviewed, fetch_limit, use_12hr):
+    _maybe_ingest()
+    alerts_df = load_alerts_from_db(include_reviewed=include_reviewed, fetch_limit=fetch_limit)
+    filtered_alerts = sidebar_alert_filters(alerts_df, key_prefix="alerts_tab")
+    render_alerts_table_and_details(filtered_alerts, use_12hr)
+
+
+@st.fragment(run_every="15s")
+def render_alerts_analytics(include_reviewed, fetch_limit):
+    """Fetches, filters, and renders analytical charts on a 15-second tick."""
+    alerts_df = load_alerts_from_db(include_reviewed=include_reviewed, fetch_limit=fetch_limit)
+    filtered_alerts = sidebar_alert_filters(alerts_df, key_prefix="analytics_tab")
+    
     st.divider()
     st.subheader("Analytics & Trends")
     col_a, col_b = st.columns(2)
@@ -633,22 +675,18 @@ def render_alerts_analytics(filtered_alerts):
     severity_breakdown_chart(filtered_alerts)
 
 
-def render_alerts_tab(alerts_df, use_12hr):
-    filtered_alerts = sidebar_alert_filters(alerts_df)
+def render_alerts_tab(include_reviewed, fetch_limit, use_12hr):
+    # 1. Live table fragment (Auto-refreshes every 2s)
+    render_live_alerts_section(include_reviewed, fetch_limit, use_12hr)
 
-    # 1. Fast interactive table & detail panel
-    render_alerts_table_and_details(filtered_alerts, use_12hr)
-
-    # 2. Isolated analytics charts
-    render_alerts_analytics(filtered_alerts)
+    # 2. Analytics fragment (Auto-refreshes every 15s)
+    render_alerts_analytics(include_reviewed, fetch_limit)
 
 
 def render_dashboard():
     t_start = time.perf_counter()
 
-    t0 = time.perf_counter()
-    _maybe_ingest()
-    t_ingest = time.perf_counter() - t0
+    # CHANGE 4: Removed _maybe_ingest() call here so full page refreshes stay instant
 
     use_12hr = st.sidebar.checkbox(
         "Use 12-hour clock (AM/PM)", value=False, key="use_12hr_toggle"
@@ -687,7 +725,7 @@ def render_dashboard():
     )
 
     if selected_tab == "Alerts":
-        render_alerts_tab(alerts_df, use_12hr)
+        render_alerts_tab(show_reviewed, fetch_limit, use_12hr)
 
     elif selected_tab == "Traffic":
         filtered_traffic = sidebar_traffic_filters(traffic_df)
@@ -757,7 +795,7 @@ def render_dashboard():
 
     t_total = time.perf_counter() - t_start
     print(
-        f"[TIMING] ingest={t_ingest:.2f}s "
+        f"[TIMING] "
         f"alerts_load={t_alerts_load:.2f}s traffic_load={t_traffic_load:.2f}s "
         f"TOTAL={t_total:.2f}s"
     )

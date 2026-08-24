@@ -2,12 +2,13 @@ import streamlit as st
 import re
 
 
-def _synced_multiselect(label, options, key, container=st.sidebar):
-    if key not in st.session_state:
-        st.session_state[key] = []
-    else:
+def _synced_multiselect(label, options, key, container=st, **kwargs):
+    # 1. Sanitize/filter session state BEFORE instantiating the widget
+    if key in st.session_state and st.session_state[key]:
         st.session_state[key] = [v for v in st.session_state[key] if v in options]
-    return container.multiselect(label, options, key=key, placeholder="All (no filter)")
+
+    # 2. Instantiate the widget AFTER modifying session_state
+    return container.multiselect(label, options, key=key, **kwargs)
 
 
 def _parse_int_range(text):
@@ -37,9 +38,6 @@ def _apply_int_filter(df, column, parsed):
 
 
 def _text_filter_with_regex(container, label, key_prefix):
-    """Renders a text input paired with a 'Use regex' checkbox. Returns
-    (search_text, use_regex). If regex is on but the pattern is invalid,
-    warns and falls back to no filter rather than crashing."""
     col1, col2 = container.columns([3, 1])
     with col1:
         text = st.text_input(label, "", key=f"{key_prefix}_text")
@@ -61,64 +59,65 @@ def _apply_text_filter(df, column, text, use_regex):
     return df[df[column].astype(str).str.contains(text, case=False, regex=False, na=False)]
 
 
-def sidebar_alert_filters(df):
+def sidebar_alert_filters(df, key_prefix="alert"):
     st.sidebar.subheader("Alert Filters")
     st.sidebar.caption("Leave any filter empty/blank to include everything for that field.")
 
     if df.empty:
-        st.sidebar.info("No alerts loaded yet.")
+        st.sidebar.info("No alert events loaded yet.")
         return df
+
+    p = key_prefix
 
     with st.sidebar.expander("Severity / Confidence / Target", expanded=True):
         severities = sorted(df["severity"].dropna().unique().tolist())
-        selected_sev = _synced_multiselect("Severity (numeric)", severities, "alert_sev_filter", container=st)
+        selected_sev = _synced_multiselect("Severity (numeric)", severities, f"{p}_sev_filter", container=st)
 
         sig_severities = sorted(df["signature_severity"].dropna().unique().tolist()) if "signature_severity" in df else []
-        selected_sig_sev = _synced_multiselect("Signature Severity", sig_severities, "alert_sigsev_filter", container=st)
+        selected_sig_sev = _synced_multiselect("Signature Severity", sig_severities, f"{p}_sigsev_filter", container=st)
 
-        # Update this block to include standard confidence options
         standard_confidences = ["High", "Medium", "Low"]
         existing_confidences = df["confidence"].dropna().unique().tolist() if "confidence" in df else []
         confidences = sorted(list(set(standard_confidences + existing_confidences)))
-        selected_confidence = _synced_multiselect("Confidence", confidences, "alert_conf_filter", container=st)
+        selected_confidence = _synced_multiselect("Confidence", confidences, f"{p}_conf_filter", container=st)
 
         targets = sorted(df["attack_target"].dropna().unique().tolist()) if "attack_target" in df else []
-        selected_target = _synced_multiselect("Attack Target", targets, "alert_target_filter", container=st)
+        selected_target = _synced_multiselect("Attack Target", targets, f"{p}_target_filter", container=st)
 
     with st.sidebar.expander("Protocol / Category / Signature", expanded=False):
         protocols = sorted(df["proto"].dropna().unique().tolist())
-        selected_proto = _synced_multiselect("Protocol", protocols, "alert_proto_filter", container=st)
+        selected_proto = _synced_multiselect("Protocol", protocols, f"{p}_proto_filter", container=st)
 
         categories = sorted(df["category"].dropna().unique().tolist()) if "category" in df else []
-        selected_categories = _synced_multiselect("Category", categories, "alert_cat_filter", container=st)
+        selected_categories = _synced_multiselect("Category", categories, f"{p}_cat_filter", container=st)
 
-        sid_search = st.text_input("Signature ID (exact or partial)", "", key="alert_sid_search")
-        sig_search, sig_regex = _text_filter_with_regex(st, "Signature message contains", "alert_sig")
+        sid_search = st.text_input("Signature ID (exact or partial)", "", key=f"{p}_sid_search")
+        sig_search, sig_regex = _text_filter_with_regex(st, "Signature message contains", f"{p}_sig")
 
     with st.sidebar.expander("IPs / Ports", expanded=False):
-        src_ip_filter, src_ip_regex = _text_filter_with_regex(st, "Source IP", "alert_src_ip")
-        dst_ip_filter, dst_ip_regex = _text_filter_with_regex(st, "Dest IP", "alert_dst_ip")
+        src_ip_filter, src_ip_regex = _text_filter_with_regex(st, "Source IP", f"{p}_src_ip")
+        dst_ip_filter, dst_ip_regex = _text_filter_with_regex(st, "Dest IP", f"{p}_dst_ip")
 
         col3, col4 = st.columns(2)
         with col3:
-            src_port_filter = st.text_input("Source Port (e.g. 80 or 1000-2000)", "", key="alert_src_port")
+            src_port_filter = st.text_input("Source Port (e.g. 80 or 1000-2000)", "", key=f"{p}_src_port")
         with col4:
-            dst_port_filter = st.text_input("Dest Port (e.g. 443 or 1-1024)", "", key="alert_dst_port")
+            dst_port_filter = st.text_input("Dest Port (e.g. 443 or 1-1024)", "", key=f"{p}_dst_port")
 
     with st.sidebar.expander("Interface / Flow / Direction", expanded=False):
         interfaces = sorted(df["in_iface"].dropna().unique().tolist()) if "in_iface" in df else []
-        selected_iface = _synced_multiselect("Interface", interfaces, "alert_iface_filter", container=st)
+        selected_iface = _synced_multiselect("Interface", interfaces, f"{p}_iface_filter", container=st)
 
         directions = sorted(df["direction"].dropna().unique().tolist()) if "direction" in df else []
-        selected_direction = _synced_multiselect("Direction", directions, "alert_direction_filter", container=st)
+        selected_direction = _synced_multiselect("Direction", directions, f"{p}_direction_filter", container=st)
 
-        flow_id_search = st.text_input("Flow ID (exact)", "", key="alert_flow_id_search")
+        flow_id_search = st.text_input("Flow ID (exact)", "", key=f"{p}_flow_id_search")
 
         col5, col6 = st.columns(2)
         with col5:
-            bytes_toserver_filter = st.text_input("Bytes to server (e.g. 1000-50000)", "", key="alert_bytes_toserver")
+            bytes_toserver_filter = st.text_input("Bytes to server (e.g. 1000-50000)", "", key=f"{p}_bytes_toserver")
         with col6:
-            bytes_toclient_filter = st.text_input("Bytes to client (e.g. 1000-50000)", "", key="alert_bytes_toclient")
+            bytes_toclient_filter = st.text_input("Bytes to client (e.g. 1000-50000)", "", key=f"{p}_bytes_toclient")
 
     time_range = None
     if df["timestamp"].notna().any():
@@ -130,7 +129,7 @@ def sidebar_alert_filters(df):
                     min_value=min_t.to_pydatetime(),
                     max_value=max_t.to_pydatetime(),
                     value=(min_t.to_pydatetime(), max_t.to_pydatetime()),
-                    key="alert_time_slider"
+                    key=f"{p}_time_slider"
                 )
 
     filtered = df.copy()
@@ -173,7 +172,7 @@ def sidebar_alert_filters(df):
     return filtered
 
 
-def sidebar_traffic_filters(df):
+def sidebar_traffic_filters(df, key_prefix="traffic"):
     st.sidebar.subheader("Traffic Filters")
     st.sidebar.caption("Leave any filter empty/blank to include everything for that field.")
 
@@ -181,40 +180,42 @@ def sidebar_traffic_filters(df):
         st.sidebar.info("No traffic events loaded yet.")
         return df
 
+    p = key_prefix
+
     with st.sidebar.expander("Event Type / Protocol", expanded=True):
         event_types = sorted(df["event_type"].dropna().unique().tolist())
-        selected_types = _synced_multiselect("Event type", event_types, "traffic_type_filter", container=st)
+        selected_types = _synced_multiselect("Event type", event_types, f"{p}_type_filter", container=st)
 
         protocols = sorted(df["proto"].dropna().unique().tolist())
-        selected_proto = _synced_multiselect("Protocol", protocols, "traffic_proto_filter", container=st)
+        selected_proto = _synced_multiselect("Protocol", protocols, f"{p}_proto_filter", container=st)
 
         app_protos = sorted(df["app_proto"].dropna().unique().tolist()) if "app_proto" in df else []
-        selected_app_proto = _synced_multiselect("App Protocol", app_protos, "traffic_app_proto_filter", container=st)
+        selected_app_proto = _synced_multiselect("App Protocol", app_protos, f"{p}_app_proto_filter", container=st)
 
     with st.sidebar.expander("IPs / Ports", expanded=False):
-        src_ip_filter, src_ip_regex = _text_filter_with_regex(st, "Source IP", "traffic_src_ip")
-        dst_ip_filter, dst_ip_regex = _text_filter_with_regex(st, "Dest IP", "traffic_dst_ip")
+        src_ip_filter, src_ip_regex = _text_filter_with_regex(st, "Source IP", f"{p}_src_ip")
+        dst_ip_filter, dst_ip_regex = _text_filter_with_regex(st, "Dest IP", f"{p}_dst_ip")
 
         col3, col4 = st.columns(2)
         with col3:
-            src_port_filter = st.text_input("Source Port", "", key="traffic_src_port")
+            src_port_filter = st.text_input("Source Port", "", key=f"{p}_src_port")
         with col4:
-            dst_port_filter = st.text_input("Dest Port", "", key="traffic_dst_port")
+            dst_port_filter = st.text_input("Dest Port", "", key=f"{p}_dst_port")
 
     with st.sidebar.expander("Interface / Flow / Direction", expanded=False):
         interfaces = sorted(df["in_iface"].dropna().unique().tolist()) if "in_iface" in df else []
-        selected_iface = _synced_multiselect("Interface", interfaces, "traffic_iface_filter", container=st)
+        selected_iface = _synced_multiselect("Interface", interfaces, f"{p}_iface_filter", container=st)
 
         directions = sorted(df["direction"].dropna().unique().tolist()) if "direction" in df else []
-        selected_direction = _synced_multiselect("Direction", directions, "traffic_direction_filter", container=st)
+        selected_direction = _synced_multiselect("Direction", directions, f"{p}_direction_filter", container=st)
 
-        flow_id_search = st.text_input("Flow ID (exact)", "", key="traffic_flow_id_search")
+        flow_id_search = st.text_input("Flow ID (exact)", "", key=f"{p}_flow_id_search")
 
         col5, col6 = st.columns(2)
         with col5:
-            bytes_toserver_filter = st.text_input("Bytes to server (e.g. 1000-50000)", "", key="traffic_bytes_toserver")
+            bytes_toserver_filter = st.text_input("Bytes to server (e.g. 1000-50000)", "", key=f"{p}_bytes_toserver")
         with col6:
-            bytes_toclient_filter = st.text_input("Bytes to client (e.g. 1000-50000)", "", key="traffic_bytes_toclient")
+            bytes_toclient_filter = st.text_input("Bytes to client (e.g. 1000-50000)", "", key=f"{p}_bytes_toclient")
 
     filtered = df.copy()
     if selected_types:

@@ -7,3 +7,8 @@ eve_offset.txt
 .streamlit/
 # Ignore large generated JSON rule files
 *.json
+# Ignore all SQLite database files
+*.db
+
+# Ignore any generated archive files/folders with timestamps
+alerts_archive*
